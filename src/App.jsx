@@ -77,6 +77,16 @@ function computeAll(mode, v) {
   return computeWout(mode, v);
 }
 
+// For floored formulas, naive algebraic inversion gives a non-integer when
+// the floor "absorbed" a remainder. Fix: round the algebraic result and
+// verify by forward-computing; accept if it reproduces W_out exactly.
+function verifyRound(algebraic, verifyFn) {
+  for (const candidate of [Math.round(algebraic), Math.floor(algebraic), Math.ceil(algebraic)]) {
+    if (candidate > 0 && verifyFn(candidate)) return candidate;
+  }
+  return null;
+}
+
 // Solve for any field given all others
 function solveFor(mode, vals, target) {
   // forward computation
@@ -92,13 +102,28 @@ function solveFor(mode, vals, target) {
   const D = (mode === "dilated") ? vals.D : 1;
   if (mode === "standard" || mode === "dilated") {
     const { W_in, K, P, S, W_out } = vals;
+    // W_in: no floor involved in inversion
     if (target === "W_in") return (W_out-1)*S - 2*P + D*(K-1) + 1;
-    if (target === "K")    { const Ke = W_in + 2*P - (W_out-1)*S; return (Ke-1)/D + 1; }
-    if (target === "P")    { const Ke = D*(K-1)+1; return ((W_out-1)*S - W_in + Ke) / 2; }
-    if (target === "S")    { const Ke = D*(K-1)+1; return (W_in + 2*P - Ke) / (W_out-1); }
-    if (target === "D")    { const Ke = W_in + 2*P - (W_out-1)*S; return (Ke-1)/(K-1); }
+    // K, P, S, D: floor in forward formula → verify rounded candidate
+    if (target === "K") {
+      const alg = (W_in + 2*P - (W_out-1)*S - 1) / D + 1;
+      return verifyRound(alg, c => computeWout(mode, {...vals, K: c}) === W_out);
+    }
+    if (target === "P") {
+      const alg = ((W_out-1)*S - W_in + D*(K-1)+1) / 2;
+      return verifyRound(alg, c => computeWout(mode, {...vals, P: c}) === W_out);
+    }
+    if (target === "S") {
+      const alg = (W_in + 2*P - (D*(K-1)+1)) / (W_out-1);
+      return verifyRound(alg, c => computeWout(mode, {...vals, S: c}) === W_out);
+    }
+    if (target === "D") {
+      const alg = (W_in + 2*P - (W_out-1)*S - 1) / (K-1);
+      return verifyRound(alg, c => computeWout(mode, {...vals, D: c}) === W_out);
+    }
   }
   if (mode === "transposed") {
+    // transposed conv has no floor, so algebra is exact
     const { W_in, K, P, S, W_out } = vals;
     if (target === "W_in") return (W_out + 2*P - K) / S + 1;
     if (target === "K")    return W_out - (W_in-1)*S + 2*P;
@@ -107,9 +132,17 @@ function solveFor(mode, vals, target) {
   }
   if (mode === "pooling") {
     const { W_in, K, S, W_out } = vals;
+    // W_in: exact
     if (target === "W_in") return (W_out-1)*S + K;
-    if (target === "K")    return W_in - (W_out-1)*S;
-    if (target === "S")    return (W_in - K) / (W_out-1);
+    // K, S: floor involved → verify
+    if (target === "K") {
+      const alg = W_in - (W_out-1)*S;
+      return verifyRound(alg, c => computeWout(mode, {...vals, K: c}) === W_out);
+    }
+    if (target === "S") {
+      const alg = (W_in - K) / (W_out-1);
+      return verifyRound(alg, c => computeWout(mode, {...vals, S: c}) === W_out);
+    }
   }
   return null;
 }
@@ -142,6 +175,14 @@ function generateProblem(mode, forcedHidden = null) {
   if (mode !== "params" && vals.W_out < 1) return generateProblem(mode, forcedHidden);
 
   const hidden = forcedHidden || fields[rand(0, fields.length-1)];
+
+  // Validate: the answer for the hidden field must be a positive integer.
+  // Floored formulas can produce non-integer inverses — just regenerate.
+  const answer = solveFor(mode, vals, hidden);
+  if (answer == null || answer <= 0 || Math.abs(answer - Math.round(answer)) > 0.001) {
+    return generateProblem(mode, forcedHidden);
+  }
+
   return { vals, hidden, mode };
 }
 
