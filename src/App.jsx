@@ -1,748 +1,476 @@
 import { useState, useEffect, useRef } from "react";
 
-// ── Config ────────────────────────────────────────────────────────────────────
-
-const MODES = [
-  { id: "standard",   label: "Standard" },
-  { id: "dilated",    label: "Dilated" },
-  { id: "transposed", label: "Transposed" },
-  { id: "pooling",    label: "Pooling" },
-  { id: "params",     label: "Params" },
-  { id: "depthwise",  label: "Depthwise" },
-  { id: "batch",      label: "Batch/Layers" },
-];
-
-// Fields shown per mode. For params/depthwise we have a "bias" toggle, not a field.
-const FIELDS = {
-  standard:   ["W_in", "K", "P", "S", "W_out"],
-  dilated:    ["W_in", "K", "D", "P", "S", "W_out"],
-  transposed: ["W_in", "K", "P", "S", "W_out"],
-  pooling:    ["W_in", "K", "S", "W_out"],
-  params:     ["K", "C_in", "C_out", "params"],      // params = K²·C_in·C_out [+ C_out bias]
-  depthwise:  ["K", "C_in", "C_out", "dw_params"],   // dw: K²·C_in + C_in·C_out [+ C_in + C_out bias]
-  batch:      ["N", "C_in", "W_in", "K", "P", "S", "C_out", "W_out"], // output shape N×C_out×W_out×W_out
+// ── Tab configuration ────────────────────────────────────────────────────────
+const TABS = {
+  standard:   { label:"Standard",   channels:"free",   k:"free", spatial:"forward",    params:"regular",   dilated:false, hasP:true  },
+  dilated:    { label:"Dilated",    channels:"free",   k:"free", spatial:"forward",    params:"regular",   dilated:true,  hasP:true  },
+  transposed: { label:"Transposed", channels:"free",   k:"free", spatial:"transposed", params:"regular",   dilated:false, hasP:true  },
+  pooling:    { label:"Pooling",    channels:"locked", k:"free", spatial:"forward",    params:"none",      dilated:false, hasP:false },
+  depthwise:  { label:"Depth-wise", channels:"locked", k:"free", spatial:"forward",    params:"depthwise", dilated:false, hasP:true  },
+  pointwise:  { label:"Point-wise", channels:"free",   k:"one",  spatial:"forward",    params:"pointwise", dilated:false, hasP:false },
+  separable:  { label:"Separable",  channels:"free",   k:"free", spatial:"forward",    params:"separable", dilated:false, hasP:true  },
 };
+const TAB_IDS = Object.keys(TABS);
+const hasParams = t => TABS[t].params !== "none";
+const Kof  = (t,v) => TABS[t].k === "one" ? 1 : v.K;
+const Coof = (t,v) => TABS[t].channels === "locked" ? v.C_in : v.C_out;
+const Pof  = (t,v) => TABS[t].hasP ? v.P : 0;
 
-const LABELS = {
-  W_in: "Input size (H=W)", K: "Kernel size", P: "Padding",
-  S: "Stride", D: "Dilation", W_out: "Output size",
-  C_in: "Input channels", C_out: "Output filters",
-  params: "Parameters", dw_params: "DW Parameters",
-  N: "Batch size",
-};
+const FIELD_ORDER = ["N","C_in","C_out","W_in","K","D","P","S","W_out","params"];
+const LABELS = { N:"Batch size", C_in:"Input channels", C_out:"Output channels", W_in:"Input size", K:"Kernel size", D:"Dilation", P:"Padding", S:"Stride", W_out:"Output size", params:"Parameters" };
+const SYMBOLS = { N:"N", C_in:"C_in", C_out:"C_out", W_in:"W_in", K:"K", D:"D", P:"P", S:"S", W_out:"W_out", params:"#params" };
 
-const SYMBOLS = {
-  W_in: "W_in", K: "K", P: "P", S: "S", D: "D", W_out: "W_out",
-  C_in: "C_in", C_out: "C_out", params: "#params", dw_params: "#params",
-  N: "N",
-};
+const modeColors = { standard:"#2563eb", dilated:"#7c3aed", transposed:"#0891b2", pooling:"#059669", depthwise:"#d97706", pointwise:"#db2777", separable:"#9333ea" };
+const sup = d => (d === 1 ? "" : d === 2 ? "²" : "³");
 
-const FORMULA = {
-  standard:   "W_out = ⌊(W_in + 2P − K) / S⌋ + 1",
-  dilated:    "K_eff = D(K−1)+1  →  W_out = ⌊(W_in + 2P − K_eff) / S⌋ + 1",
-  transposed: "W_out = (W_in − 1)×S − 2P + K",
-  pooling:    "W_out = ⌊(W_in − K) / S⌋ + 1",
-  params:     "params = K²×C_in×C_out  [+ C_out if bias]",
-  depthwise:  "DW: K²×C_in  +  PW: C_in×C_out  [+ C_in + C_out if bias]",
-  batch:      "Output tensor: N × C_out × W_out × W_out",
-};
+// Which rows are visible for a tab
+function visibleFields(t) {
+  const cfg = TABS[t];
+  return FIELD_ORDER.filter(f => {
+    if (f === "C_out")  return true;           // shown (derived if locked)
+    if (f === "D")      return cfg.dilated;
+    if (f === "P")      return cfg.hasP;
+    if (f === "params") return hasParams(t);
+    return true;
+  });
+}
+// Editable input rows (explorer)
+function isEditable(t, f) {
+  const cfg = TABS[t];
+  if (f === "W_out" || f === "params") return false;
+  if (f === "C_out" && cfg.channels === "locked") return false;
+  if (f === "K" && cfg.k === "one") return false;
+  return true;
+}
+// Locked/derived display rows
+const isLocked = (t,f) => (f==="C_out" && TABS[t].channels==="locked") || (f==="K" && TABS[t].k==="one");
 
-const modeColors = {
-  standard: "#2563eb", dilated: "#7c3aed", transposed: "#0891b2",
-  pooling: "#059669", params: "#b45309", depthwise: "#be185d", batch: "#0f766e",
-};
-
-const DEFAULT_COMPUTED = {
-  standard: "W_out", dilated: "W_out", transposed: "W_out", pooling: "W_out",
-  params: "params", depthwise: "dw_params", batch: "W_out",
-};
-
-const EXPLORER_DEFAULTS = {
-  standard:   { W_in: 28, K: 3, P: 0, S: 1 },
-  dilated:    { W_in: 28, K: 3, D: 2, P: 0, S: 1 },
-  transposed: { W_in: 4,  K: 3, P: 0, S: 1 },
-  pooling:    { W_in: 28, K: 2, S: 2 },
-  params:     { K: 3, C_in: 64, C_out: 128 },
-  depthwise:  { K: 3, C_in: 64, C_out: 128 },
-  batch:      { N: 8, C_in: 3, W_in: 32, K: 3, P: 1, S: 1, C_out: 16 },
-};
-
-// ── Math ──────────────────────────────────────────────────────────────────────
-
-function rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-
-function computeWout(mode, v) {
-  const { W_in, K, P = 0, S, D = 1 } = v;
-  if (!W_in || !K || !S) return null;
-  if (mode === "standard" || mode === "dilated" || mode === "batch") {
-    const r = Math.floor((W_in + 2*P - (D*(K-1)+1)) / S) + 1;
-    return r >= 1 ? r : null;
+// ── Math (verified) ──────────────────────────────────────────────────────────
+const ipow = (b,e)=>Math.pow(b,e);
+function spatialOut(t, v, dims) {
+  const cfg = TABS[t];
+  const K = Kof(t,v), D = cfg.dilated ? v.D : 1, P = Pof(t,v), S = v.S, W = v.W_in;
+  if (!W || !K || !S) return null;
+  if (cfg.spatial === "transposed") { const r=(W-1)*S-2*P+K; return r>=1?r:null; }
+  const r = Math.floor((W + 2*P - (D*(K-1)+1))/S) + 1;
+  return r>=1?r:null;
+}
+function paramCount(t, v, dims, bias) {
+  const cfg = TABS[t];
+  if (cfg.params === "none") return 0;
+  const K = Kof(t,v), Ci = v.C_in, Co = Coof(t,v);
+  if (!K || !Ci) return null;
+  if (cfg.params === "regular")   { if(!Co) return null; const w=ipow(K,dims)*Ci*Co; return bias?w+Co:w; }
+  if (cfg.params === "depthwise") { const w=ipow(K,dims)*Ci;       return bias?w+Ci:w; }
+  if (cfg.params === "pointwise") { if(!Co) return null; const w=Ci*Co; return bias?w+Co:w; }
+  if (cfg.params === "separable") { if(!Co) return null; const dw=ipow(K,dims)*Ci, pw=Ci*Co; let tt=dw+pw; if(bias)tt+=Ci+Co; return tt; }
+}
+function verifyRound(alg, ok){ for(const c of [Math.round(alg),Math.floor(alg),Math.ceil(alg)]) if(c>0&&ok(c)) return c; return null; }
+function guessChannel(t, v, dims, bias, which) {
+  const p = TABS[t].params, K = Kof(t,v), Ci=v.C_in, Co=v.C_out, P=v.params, kp=ipow(K,dims);
+  if (which === "C_in") {
+    if (p==="regular")   return (bias?P-Co:P)/(kp*Co);
+    if (p==="depthwise") return P/(kp+(bias?1:0));
+    if (p==="pointwise") return (bias?P-Co:P)/Co;
+    if (p==="separable") return bias?(P-Co)/(kp+Co+1):P/(kp+Co);
+  } else {
+    if (p==="regular")   return bias?P/(kp*Ci+1):P/(kp*Ci);
+    if (p==="pointwise") return bias?P/(Ci+1):P/Ci;
+    if (p==="separable") return (P-kp*Ci-(bias?Ci:0))/(Ci+(bias?1:0));
   }
-  if (mode === "transposed") { const r = (W_in-1)*S - 2*P + K; return r >= 1 ? r : null; }
-  if (mode === "pooling")    { const r = Math.floor((W_in - K) / S) + 1; return r >= 1 ? r : null; }
-  return null;
+  return NaN;
 }
-
-function computeParams(v, bias) {
-  const { K, C_in, C_out } = v;
-  if (!K || !C_in || !C_out) return null;
-  return K * K * C_in * C_out + (bias ? C_out : 0);
-}
-
-function computeDWParams(v, bias) {
-  const { K, C_in, C_out } = v;
-  if (!K || !C_in || !C_out) return null;
-  // depthwise: K²×C_in  +  pointwise: 1×1×C_in×C_out  + optional biases
-  return K*K*C_in + C_in*C_out + (bias ? C_in + C_out : 0);
-}
-
-function computeAll(mode, v, bias = false) {
-  if (mode === "params")    return computeParams(v, bias);
-  if (mode === "depthwise") return computeDWParams(v, bias);
-  if (mode === "batch")     return computeWout("batch", v);
-  return computeWout(mode, v);
-}
-
-function verifyRound(algebraic, verifyFn) {
-  for (const c of [Math.round(algebraic), Math.floor(algebraic), Math.ceil(algebraic)]) {
-    if (c > 0 && verifyFn(c)) return c;
+function solveFor(t, vals, target, dims, bias) {
+  const cfg = TABS[t];
+  if (target === "W_out")  return spatialOut(t, vals, dims);
+  if (target === "params") return paramCount(t, vals, dims, bias);
+  if (target === "C_in" || target === "C_out")
+    return verifyRound(guessChannel(t, vals, dims, bias, target), c => paramCount(t, {...vals, [target]:c}, dims, bias) === vals.params);
+  const K = Kof(t,vals), D = cfg.dilated ? vals.D : 1, P = Pof(t,vals), S = vals.S, Wout = vals.W_out;
+  if (cfg.spatial === "transposed") {
+    if (target==="W_in") return (Wout+2*P-K)/S+1;
+    if (target==="K")    return Wout-(vals.W_in-1)*S+2*P;
+    if (target==="P")    return ((vals.W_in-1)*S+K-Wout)/2;
+    if (target==="S")    return (Wout+2*P-K)/(vals.W_in-1);
+  } else {
+    const Keff = D*(K-1)+1;
+    if (target==="W_in") return (Wout-1)*S - 2*P + Keff;
+    if (target==="K") return verifyRound((vals.W_in+2*P-(Wout-1)*S-1)/D+1, c=>spatialOut(t,{...vals,K:c},dims)===Wout);
+    if (target==="P") return verifyRound(((Wout-1)*S-vals.W_in+Keff)/2,    c=>spatialOut(t,{...vals,P:c},dims)===Wout);
+    if (target==="S") return verifyRound((vals.W_in+2*P-Keff)/(Wout-1),    c=>spatialOut(t,{...vals,S:c},dims)===Wout);
+    if (target==="D") return verifyRound((vals.W_in+2*P-(Wout-1)*S-1)/(vals.K-1), c=>spatialOut(t,{...vals,D:c},dims)===Wout);
   }
   return null;
 }
-
-function solveFor(mode, vals, target, bias = false) {
-  if (target === "W_out" || target === "params" || target === "dw_params")
-    return computeAll(mode, vals, bias);
-
-  // params mode — solve for K, C_in, C_out
-  if (mode === "params") {
-    const { K, C_in, C_out, params } = vals;
-    const p = params - (bias ? C_out : 0);   // strip bias before solving
-    if (target === "K")     return verifyRound(Math.sqrt(p / (C_in * C_out)), c => c*c*C_in*C_out + (bias ? C_out : 0) === params);
-    if (target === "C_in")  return p / (K * K * C_out);
-    if (target === "C_out") {
-      // C_out appears in both weight and bias term: p_nobias = K²·C_in·C_out, but bias=C_out
-      // so params = K²·C_in·C_out + C_out = C_out(K²·C_in + 1)
-      return bias ? params / (K*K*C_in + 1) : params / (K*K*C_in);
-    }
-  }
-
-  // depthwise — only forward computation is tractable for DW; C_in/C_out/K not easily invertible
-  // so we don't hide those (generator avoids it)
-
-  // spatial modes
-  const D = (mode === "dilated") ? vals.D : 1;
-  const spatialMode = (mode === "batch") ? "standard" : mode;
-
-  if (mode === "standard" || mode === "dilated" || mode === "batch") {
-    const { W_in, K, P, S, W_out } = vals;
-    if (target === "W_in") return (W_out-1)*S - 2*P + D*(K-1) + 1;
-    if (target === "K") {
-      const alg = (W_in + 2*P - (W_out-1)*S - 1) / D + 1;
-      return verifyRound(alg, c => computeWout(mode, {...vals, K: c}) === W_out);
-    }
-    if (target === "P") {
-      const alg = ((W_out-1)*S - W_in + D*(K-1)+1) / 2;
-      return verifyRound(alg, c => computeWout(mode, {...vals, P: c}) === W_out);
-    }
-    if (target === "S") {
-      const alg = (W_in + 2*P - (D*(K-1)+1)) / (W_out-1);
-      return verifyRound(alg, c => computeWout(mode, {...vals, S: c}) === W_out);
-    }
-    if (target === "D") {
-      const alg = (W_in + 2*P - (W_out-1)*S - 1) / (K-1);
-      return verifyRound(alg, c => computeWout(mode, {...vals, D: c}) === W_out);
-    }
-    // batch-specific: N and C_out are directly readable
-    if (target === "N") return vals.W_out ? vals.N : null; // N doesn't affect W_out calc
-    if (target === "C_out") return null; // C_out doesn't affect spatial dims
-    if (target === "C_in")  return null;
-  }
-  if (mode === "transposed") {
-    const { W_in, K, P, S, W_out } = vals;
-    if (target === "W_in") return (W_out + 2*P - K) / S + 1;
-    if (target === "K")    return W_out - (W_in-1)*S + 2*P;
-    if (target === "P")    return ((W_in-1)*S + K - W_out) / 2;
-    if (target === "S")    return (W_out + 2*P - K) / (W_in-1);
-  }
-  if (mode === "pooling") {
-    const { W_in, K, S, W_out } = vals;
-    if (target === "W_in") return (W_out-1)*S + K;
-    if (target === "K") {
-      return verifyRound(W_in - (W_out-1)*S, c => computeWout(mode, {...vals, K: c}) === W_out);
-    }
-    if (target === "S") {
-      const alg = (W_in - K) / (W_out-1);
-      return verifyRound(alg, c => computeWout(mode, {...vals, S: c}) === W_out);
-    }
-  }
-  return null;
+function grade(t, vals, hidden, userVal, dims, bias) {
+  if (hidden === "W_out")  return userVal === spatialOut(t, vals, dims);
+  if (hidden === "params") return userVal === paramCount(t, vals, dims, bias);
+  const sub = {...vals, [hidden]: userVal};
+  let ok = spatialOut(t, sub, dims) === vals.W_out;
+  if (hasParams(t)) ok = ok && paramCount(t, sub, dims, bias) === vals.params;
+  return ok;
+}
+function eligible(t) {
+  const cfg = TABS[t], f = ["W_out"];
+  if (hasParams(t)) { f.push("params","C_in"); if (cfg.channels==="free") f.push("C_out"); }
+  f.push("W_in","S");
+  if (cfg.k!=="one") f.push("K");
+  if (cfg.hasP) f.push("P");
+  if (cfg.dilated) f.push("D");
+  return f;
+}
+function uniqueHidden(t, v, hidden, dims, bias) {
+  if (["W_out","params","C_in","C_out"].includes(hidden)) return true;
+  const MAX = {W_in:80, K:15, P:12, S:20, D:10}[hidden] || 80;
+  let count=0;
+  for (let c=1;c<=MAX;c++){ if (grade(t, v, hidden, c, dims, bias)) { count++; if(count>1) return false; } }
+  return count===1;
+}
+const rand=(a,b)=>Math.floor(Math.random()*(b-a+1))+a;
+function gen(t, dims, bias, forced, depth=0) {
+  if (depth > 200) return null;
+  const cfg = TABS[t]; let v = { N: rand(1,8), C_in: rand(1,16)*4 };
+  if (cfg.channels==="free") v.C_out = rand(1,16)*4;
+  v.W_in = rand(8, 32);
+  v.K = cfg.k==="one" ? 1 : (dims===3?rand(1,3)*2-1:rand(1,7)*2-1);
+  if (cfg.dilated) v.D = rand(1,3);
+  v.P = cfg.hasP ? rand(0, Math.floor((cfg.k==="one"?1:v.K)/2)) : 0;
+  v.S = cfg.spatial==="transposed" ? rand(1,3) : rand(1, Math.min(3, v.K + 2*v.P));
+  v.W_out = spatialOut(t, v, dims);
+  v.params = paramCount(t, v, dims, bias);
+  if (v.W_out==null || v.W_out<1) return gen(t,dims,bias,forced,depth+1);
+  const elig = eligible(t);
+  const hidden = forced || elig[rand(0,elig.length-1)];
+  const ans = solveFor(t, v, hidden, dims, bias);
+  if (ans==null || ans<=0 || Math.abs(ans-Math.round(ans))>1e-6) return gen(t,dims,bias,forced,depth+1);
+  if (!uniqueHidden(t, v, hidden, dims, bias)) return gen(t,dims,bias,forced,depth+1);
+  return { v, hidden, mode:t };
 }
 
-// ── Problem generator ─────────────────────────────────────────────────────────
+// ── Working renderers ─────────────────────────────────────────────────────────
+const blk = c => ({ color:c, display:"block" });
+function SpatialWork({ t, v, dims, result, accent }) {
+  const cfg = TABS[t], K = Kof(t,v), D = cfg.dilated ? v.D : 1, P = Pof(t,v), S = v.S, W = v.W_in;
+  const s = blk("#888"), r = blk(accent);
+  if (cfg.spatial === "transposed") return <>
+    <span style={s}>W_out = (W_in − 1)×S − 2P + K</span>
+    <span style={s}>= ({W}−1)×{S} − 2×{P} + {K}</span>
+    <span style={r}>= {result}</span></>;
+  const Keff = D*(K-1)+1;
+  return <>
+    {cfg.dilated && <span style={s}>K_eff = D(K−1)+1 = {D}×({K}−1)+1 = {Keff}</span>}
+    <span style={s}>W_out = ⌊(W_in + 2P − {cfg.dilated?"K_eff":"K"}) / S⌋ + 1</span>
+    <span style={s}>= ⌊({W} + 2×{P} − {Keff}) / {S}⌋ + 1</span>
+    <span style={s}>= ⌊{W + 2*P - Keff} / {S}⌋ + 1</span>
+    <span style={r}>= {result}</span></>;
+}
+function ParamWork({ t, v, dims, bias, result, accent }) {
+  const cfg = TABS[t], K = Kof(t,v), Ci = v.C_in, Co = Coof(t,v), kp = ipow(K,dims);
+  const s = blk("#888"), r = blk(accent);
+  if (cfg.params === "none") return <span style={r}>Pooling has no learnable parameters → 0</span>;
+  if (cfg.params === "regular") return <>
+    <span style={s}>#params = K{sup(dims)} × C_in × C_out{bias?" + C_out":""}</span>
+    <span style={s}>= {K}{sup(dims)} × {Ci} × {Co}{bias?` + ${Co}`:""}</span>
+    <span style={s}>= {kp} × {Ci} × {Co}{bias?` + ${Co}`:""}</span>
+    <span style={r}>= {result}</span></>;
+  if (cfg.params === "depthwise") return <>
+    <span style={s}>one K{sup(dims)} filter per input channel</span>
+    <span style={s}>#params = K{sup(dims)} × C_in{bias?" + C_in":""}</span>
+    <span style={s}>= {kp} × {Ci}{bias?` + ${Ci}`:""}</span>
+    <span style={r}>= {result}</span></>;
+  if (cfg.params === "pointwise") return <>
+    <span style={s}>1×1 conv mixing channels</span>
+    <span style={s}>#params = C_in × C_out{bias?" + C_out":""}</span>
+    <span style={s}>= {Ci} × {Co}{bias?` + ${Co}`:""}</span>
+    <span style={r}>= {result}</span></>;
+  // separable
+  const dw = kp*Ci, pw = Ci*Co;
+  return <>
+    <span style={s}>Depth-wise: K{sup(dims)} × C_in = {kp} × {Ci} = {dw}{bias?` (+${Ci} bias)`:""}</span>
+    <span style={s}>Point-wise: C_in × C_out = {Ci} × {Co} = {pw}{bias?` (+${Co} bias)`:""}</span>
+    <span style={s}>Total = {dw} + {pw}{bias?` + ${Ci} + ${Co}`:""}</span>
+    <span style={r}>= {result}</span></>;
+}
 
-// Fields that can be hidden per mode (exclude N, C_out, C_in from batch since they don't affect W_out)
-const HIDEABLE = {
-  standard:   ["W_in", "K", "P", "S", "W_out"],
-  dilated:    ["W_in", "K", "D", "P", "S", "W_out"],
-  transposed: ["W_in", "K", "P", "S", "W_out"],
-  pooling:    ["W_in", "K", "S", "W_out"],
-  params:     ["K", "C_in", "C_out", "params"],
-  depthwise:  ["dw_params"],   // only hide the answer; K/C_in/C_out inversion is ambiguous
-  batch:      ["W_in", "K", "P", "S", "W_out"],
+// ── Explorer defaults ─────────────────────────────────────────────────────────
+const EX_DEFAULTS = {
+  standard:   { N:1, C_in:3,  C_out:16, W_in:28, K:3, P:0, S:1 },
+  dilated:    { N:1, C_in:3,  C_out:16, W_in:28, K:3, D:2, P:0, S:1 },
+  transposed: { N:1, C_in:16, C_out:8,  W_in:4,  K:3, P:0, S:2 },
+  pooling:    { N:1, C_in:16, W_in:28, K:2, S:2 },
+  depthwise:  { N:1, C_in:16, W_in:28, K:3, P:1, S:1 },
+  pointwise:  { N:1, C_in:16, C_out:64, W_in:28, K:1, S:1 },
+  separable:  { N:1, C_in:16, C_out:64, W_in:28, K:3, P:1, S:1 },
 };
-
-function generateProblem(mode, forcedHidden = null, bias = false) {
-  let vals = {};
-  const hideableFields = HIDEABLE[mode];
-
-  if (mode === "standard") {
-    vals.K = rand(1,7)*2-1; vals.S = rand(1,3); vals.P = rand(0, Math.floor(vals.K/2));
-    vals.W_in = rand(Math.max(vals.K - 2*vals.P, 4), 32);
-    vals.W_out = computeWout(mode, vals);
-  } else if (mode === "dilated") {
-    vals.K = rand(2,5); vals.D = rand(1,4); vals.S = rand(1,2); vals.P = rand(0, vals.K-1);
-    vals.W_in = rand(Math.max(vals.D*(vals.K-1)+1 - 2*vals.P, 6), 32);
-    vals.W_out = computeWout(mode, vals);
-  } else if (mode === "transposed") {
-    vals.K = rand(2,5); vals.S = rand(1,3); vals.P = rand(0, vals.K-1); vals.W_in = rand(2,12);
-    vals.W_out = computeWout(mode, vals);
-  } else if (mode === "pooling") {
-    vals.K = rand(2,4); vals.S = rand(1, vals.K); vals.W_in = rand(vals.K, 28);
-    vals.W_out = computeWout(mode, vals);
-  } else if (mode === "params") {
-    vals.K = rand(1,5)*2-1; vals.C_in = rand(1,8)*8; vals.C_out = rand(1,8)*8;
-    vals.params = computeParams(vals, bias);
-  } else if (mode === "depthwise") {
-    vals.K = rand(1,5)*2-1; vals.C_in = rand(1,8)*8; vals.C_out = rand(1,8)*8;
-    vals.dw_params = computeDWParams(vals, bias);
-  } else if (mode === "batch") {
-    vals.N = rand(1,8)*2;
-    vals.C_in = rand(1,4)*4;
-    vals.C_out = rand(1,8)*8;
-    vals.K = rand(1,5)*2-1; vals.S = rand(1,3); vals.P = rand(0, Math.floor(vals.K/2));
-    vals.W_in = rand(Math.max(vals.K - 2*vals.P, 8), 64);
-    vals.W_out = computeWout("batch", vals);
-  }
-
-  if (["standard","dilated","transposed","pooling","batch"].includes(mode) && vals.W_out < 1)
-    return generateProblem(mode, forcedHidden, bias);
-
-  const hidden = forcedHidden || hideableFields[rand(0, hideableFields.length-1)];
-
-  // Validate integer answer
-  const answer = solveFor(mode, vals, hidden, bias);
-  if (answer == null || answer <= 0 || Math.abs(answer - Math.round(answer)) > 0.001)
-    return generateProblem(mode, forcedHidden, bias);
-
-  return { vals, hidden, mode, bias };
-}
-
-// ── Working step renderer ─────────────────────────────────────────────────────
-
-function Working({ mode, vals, result, accent, bias }) {
-  const s = { color: "#888", display: "block" };
-  const r = { color: accent, display: "block" };
-
-  if (mode === "standard" || mode === "batch") {
-    const { W_in, K, P, S } = vals;
-    return <>
-      <span style={s}>W_out = ⌊(W_in + 2P − K) / S⌋ + 1</span>
-      <span style={s}>= ⌊({W_in} + 2×{P} − {K}) / {S}⌋ + 1</span>
-      <span style={s}>= ⌊{W_in + 2*P - K} / {S}⌋ + 1</span>
-      <span style={r}>= {result}</span>
-      {mode === "batch" && <span style={{...s, marginTop: 8}}>Output tensor: {vals.N} × {vals.C_out} × {result} × {result}</span>}
-    </>;
-  }
-  if (mode === "dilated") {
-    const { W_in, K, D, P, S } = vals;
-    const Ke = D*(K-1)+1;
-    return <>
-      <span style={s}>K_eff = {D}×({K}−1)+1 = {Ke}</span>
-      <span style={s}>W_out = ⌊(W_in + 2P − K_eff) / S⌋ + 1</span>
-      <span style={s}>= ⌊({W_in} + 2×{P} − {Ke}) / {S}⌋ + 1</span>
-      <span style={s}>= ⌊{W_in + 2*P - Ke} / {S}⌋ + 1</span>
-      <span style={r}>= {result}</span>
-    </>;
-  }
-  if (mode === "transposed") {
-    const { W_in, K, P, S } = vals;
-    return <>
-      <span style={s}>W_out = (W_in − 1)×S − 2P + K</span>
-      <span style={s}>= ({W_in}−1)×{S} − 2×{P} + {K}</span>
-      <span style={s}>= {(W_in-1)*S} − {2*P} + {K}</span>
-      <span style={r}>= {result}</span>
-    </>;
-  }
-  if (mode === "pooling") {
-    const { W_in, K, S } = vals;
-    return <>
-      <span style={s}>W_out = ⌊(W_in − K) / S⌋ + 1</span>
-      <span style={s}>= ⌊({W_in} − {K}) / {S}⌋ + 1</span>
-      <span style={s}>= ⌊{W_in - K} / {S}⌋ + 1</span>
-      <span style={r}>= {result}</span>
-    </>;
-  }
-  if (mode === "params") {
-    const { K, C_in, C_out } = vals;
-    const w = K*K*C_in*C_out;
-    return <>
-      <span style={s}>weights = K² × C_in × C_out</span>
-      <span style={s}>= {K}² × {C_in} × {C_out} = {w}</span>
-      {bias
-        ? <><span style={s}>+ bias = C_out = {C_out}</span><span style={r}>total = {w} + {C_out} = {result}</span></>
-        : <span style={r}>= {result}</span>}
-    </>;
-  }
-  if (mode === "depthwise") {
-    const { K, C_in, C_out } = vals;
-    const dw = K*K*C_in;
-    const pw = C_in*C_out;
-    const biasTerm = bias ? C_in + C_out : 0;
-    return <>
-      <span style={s}>Depth-wise:  K² × C_in = {K}² × {C_in} = {dw}</span>
-      <span style={s}>Point-wise:  C_in × C_out = {C_in} × {C_out} = {pw}</span>
-      {bias && <span style={s}>Bias: C_in + C_out = {C_in} + {C_out} = {biasTerm}</span>}
-      <span style={s}>Total = {dw} + {pw}{bias ? ` + ${biasTerm}` : ""}</span>
-      <span style={r}>= {result}</span>
-      <span style={{...s, marginTop: 8, fontSize: 11}}>
-        vs regular: {K}²×{C_in}×{C_out}{bias?`+${C_out}`:""} = {K*K*C_in*C_out + (bias ? C_out : 0)}
-        {" "}(×{((K*K*C_in*C_out + (bias?C_out:0)) / result).toFixed(1)} more params)
-      </span>
-    </>;
-  }
-  return null;
-}
 
 // ── App ───────────────────────────────────────────────────────────────────────
-
 export default function App() {
-  const [appMode, setAppMode]       = useState("quiz");
-  const [activeMode, setActiveMode] = useState("standard");
-  const [bias, setBias]             = useState(false);
+  const [appMode, setAppMode] = useState("quiz");
+  const [tab, setTab]         = useState("standard");
+  const [dims, setDims]       = useState(2);
+  const [bias, setBias]       = useState(false);
 
-  // Quiz
-  const [problem, setProblem]       = useState(() => generateProblem("standard", null, false));
-  const [input, setInput]           = useState("");
-  const [status, setStatus]         = useState(null);
-  const [streak, setStreak]         = useState(0);
-  const [best, setBest]             = useState(0);
-  const [total, setTotal]           = useState(0);
-  const [correct, setCorrect]       = useState(0);
-  const [showHint, setShowHint]     = useState(false);
-  const [wrongAnswer, setWrongAnswer] = useState(null);
+  const [problem, setProblem] = useState(() => gen("standard", 2, false, null));
+  const [input, setInput]     = useState("");
+  const [status, setStatus]   = useState(null);
+  const [streak, setStreak]   = useState(0);
+  const [best, setBest]       = useState(0);
+  const [total, setTotal]     = useState(0);
+  const [correct, setCorrect] = useState(0);
+  const [showHint, setShowHint] = useState(false);
   const inputRef = useRef(null);
 
-  // Explorer
-  const [exVals, setExVals]       = useState({ ...EXPLORER_DEFAULTS["standard"] });
-  const [exComputed, setExComputed] = useState("W_out");
+  const [exVals, setExVals] = useState({ ...EX_DEFAULTS["standard"] });
 
-  useEffect(() => {
-    if (appMode === "quiz" && inputRef.current) inputRef.current.focus();
-  }, [problem, appMode]);
+  useEffect(() => { if (appMode==="quiz" && inputRef.current) inputRef.current.focus(); }, [problem, appMode]);
 
-  function newProblem(mode, forcedHidden = null, biasSetting = bias) {
-    setProblem(generateProblem(mode, forcedHidden, biasSetting));
-    setInput(""); setStatus(null); setShowHint(false); setWrongAnswer(null);
-  }
-
-  function handleModeChange(mode) {
-    setActiveMode(mode);
-    if (appMode === "quiz") newProblem(mode, null, bias);
-    else { setExVals({ ...EXPLORER_DEFAULTS[mode] }); setExComputed(DEFAULT_COMPUTED[mode]); }
+  function newProblem(t=tab, forced=null, d=dims, b=bias) { setProblem(gen(t, d, b, forced)); setInput(""); setStatus(null); setShowHint(false); }
+  function changeTab(t) {
+    setTab(t);
+    if (appMode==="quiz") newProblem(t);
+    else setExVals({ ...EX_DEFAULTS[t] });
     setStreak(0);
   }
+  function switchApp(m) { setAppMode(m); if (m==="explorer") setExVals({ ...EX_DEFAULTS[tab] }); else newProblem(tab); }
+  function changeDims(d) { setDims(d); if (appMode==="quiz") newProblem(tab, null, d, bias); }
+  function changeBias(b) { setBias(b); if (appMode==="quiz") newProblem(tab, null, dims, b); }
 
-  function handleBiasToggle() {
-    const nb = !bias;
-    setBias(nb);
-    if (appMode === "quiz") newProblem(activeMode, null, nb);
-  }
-
-  function handleAppModeSwitch(m) {
-    setAppMode(m);
-    if (m === "explorer") { setExVals({ ...EXPLORER_DEFAULTS[activeMode] }); setExComputed(DEFAULT_COMPUTED[activeMode]); }
-    else newProblem(activeMode, null, bias);
-  }
-
-  function handleSubmit() {
-    if (status === "correct") { newProblem(activeMode); return; }
+  function submit() {
+    if (status==="correct") { newProblem(); return; }
     if (!input.trim()) return;
-    const userVal = parseFloat(input.trim());
-    const answer = solveFor(problem.mode, problem.vals, problem.hidden, problem.bias);
-    const isCorrect = Math.abs(userVal - answer) < 0.01;
-    setTotal(t => t+1);
-    if (isCorrect) {
-      setStatus("correct"); setCorrect(c => c+1);
-      const ns = streak+1; setStreak(ns); setBest(b => Math.max(b, ns));
-    } else {
-      setStatus("wrong"); setWrongAnswer(answer); setStreak(0);
-    }
+    const ok = grade(problem.mode, problem.v, problem.hidden, parseFloat(input.trim()), dims, bias);
+    setTotal(x=>x+1);
+    if (ok) { setStatus("correct"); setCorrect(x=>x+1); const ns=streak+1; setStreak(ns); setBest(b=>Math.max(b,ns)); }
+    else    { setStatus("wrong"); setStreak(0); }
   }
+  function onKey(e){ if(e.key==="Enter") submit(); }
+  function pinQuiz(f){ if (status!=="correct" && eligible(tab).includes(f)) newProblem(tab, f); }
+  function exChange(f, raw){ setExVals(p => ({ ...p, [f]: raw===""?"":Number(raw) })); }
 
-  function handleKey(e) { if (e.key === "Enter") handleSubmit(); }
+  const accent = modeColors[tab];
+  const cfg = TABS[tab];
+  const vis = visibleFields(tab);
+  const elig = eligible(tab);
 
-  function handlePinField(f) {
-    if (status === "correct") return;
-    if (!HIDEABLE[activeMode].includes(f)) return; // non-hideable field (e.g. N in batch)
-    newProblem(activeMode, f, bias);
-  }
+  // quiz derived
+  const { v, hidden } = problem || { v:{}, hidden:null };
+  const genAnswer = problem ? (hidden==="W_out"?v.W_out : hidden==="params"?v.params : v[hidden]) : null;
+  const quizWout = problem ? spatialOut(tab, v, dims) : null;
+  const quizCo = problem ? Coof(tab, v) : null;
 
-  function handleExChange(field, raw) {
-    setExVals(prev => ({ ...prev, [field]: raw === "" ? "" : Number(raw) }));
-  }
+  // explorer derived
+  const exWout = spatialOut(tab, exVals, dims);
+  const exParams = paramCount(tab, exVals, dims, bias);
+  const exCo = Coof(tab, exVals);
 
-  function handleExPin(f) {
-    if (!HIDEABLE[activeMode].includes(f)) return;
-    setExComputed(f);
-    setExVals(prev => ({ ...prev, [f]: null }));
-  }
-
-  const accent = modeColors[activeMode];
-  const { vals, hidden, mode } = problem;
-  const quizFields = FIELDS[mode];
-  const exFields = FIELDS[activeMode];
-  const exResult = solveFor(activeMode, exVals, exComputed, bias);
-
-  const showBiasToggle = ["params", "depthwise"].includes(activeMode);
+  const dispVal = (src, f) => f==="C_out" && cfg.channels==="locked" ? src.C_in : f==="K" && cfg.k==="one" ? 1 : src[f];
+  const shapeStr = (N, Co, W) => `${N ?? "?"} × ${Co ?? "?"} × ${W!=null ? Array(dims).fill(W).join(" × ") : "?"}`;
+  const paramHint = hidden && ["C_in","C_out","params"].includes(hidden);
 
   return (
-    <div style={{ fontFamily: "'IBM Plex Mono', monospace", minHeight: "100vh", background: "#0d0d0f", color: "#e8e4dc" }}>
+    <div style={{ fontFamily:"'IBM Plex Mono', monospace", minHeight:"100vh", background:"#0d0d0f", color:"#e8e4dc" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { background: #0d0d0f; }
-        .tab-btn {
-          font-family: 'IBM Plex Sans', sans-serif; font-size: 12px; font-weight: 500;
-          letter-spacing: 0.06em; padding: 7px 18px; border-radius: 3px;
-          border: 1px solid #2a2a2e; background: transparent;
-          color: #555; cursor: pointer; transition: all 0.15s; text-transform: uppercase;
-        }
-        .tab-btn:hover { color: #999; border-color: #444; }
-        .tab-btn.tab-active { color: #0d0d0f; border-color: transparent; }
-        .mode-btn {
-          font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500;
-          letter-spacing: 0.07em; padding: 5px 12px; border-radius: 3px;
-          border: 1px solid #2a2a2e; background: transparent;
-          color: #666; cursor: pointer; transition: all 0.15s; text-transform: uppercase;
-        }
-        .mode-btn:hover { border-color: #444; color: #aaa; }
-        .mode-btn.active { color: #0d0d0f; border-color: transparent; }
-        .bias-toggle {
-          display: flex; align-items: center; gap: 8px;
-          font-family: 'IBM Plex Sans', sans-serif; font-size: 11px; color: #555;
-          cursor: pointer; padding: 5px 10px; border-radius: 3px;
-          border: 1px solid #2a2a2e; transition: all 0.15s; letter-spacing: 0.05em;
-          text-transform: uppercase; user-select: none;
-        }
-        .bias-toggle:hover { border-color: #444; color: #888; }
-        .bias-toggle.on { border-color: transparent; color: #0d0d0f; }
-        .toggle-dot {
-          width: 28px; height: 15px; border-radius: 8px; background: #222;
-          position: relative; transition: background 0.15s; flex-shrink: 0;
-        }
-        .toggle-dot::after {
-          content: ''; position: absolute; top: 2px; left: 2px;
-          width: 11px; height: 11px; border-radius: 50%; background: #555;
-          transition: all 0.15s;
-        }
-        .toggle-dot.on { background: #10b981; }
-        .toggle-dot.on::after { left: 15px; background: #fff; }
-        .field-row {
-          display: flex; align-items: center; gap: 12px;
-          padding: 10px 16px; border-bottom: 1px solid #1a1a1e; transition: background 0.12s;
-          position: relative;
-        }
-        .field-row:last-child { border-bottom: none; }
-        .field-row.is-hidden   { background: #16161a; }
-        .field-row.is-computed { background: #0a1a14; }
-        .field-row.is-pinnable { cursor: pointer; }
-        .field-row.is-pinnable:hover { background: #141418; }
-        .field-row.is-pinnable:hover .pin-hint { opacity: 1; }
-        .field-row.is-hidden.is-pinnable:hover   { background: #1c1c22; }
-        .field-row.is-computed.is-pinnable:hover { background: #0d2018; }
-        .pin-hint {
-          opacity: 0; font-size: 10px; color: #444; font-family: 'IBM Plex Sans', sans-serif;
-          transition: opacity 0.15s; margin-left: auto; white-space: nowrap; letter-spacing: 0.06em;
-        }
-        .field-label { font-size: 11px; color: #555; width: 130px; flex-shrink: 0; font-family: 'IBM Plex Sans', sans-serif; letter-spacing: 0.04em; }
-        .field-sym { font-size: 13px; font-weight: 600; width: 60px; flex-shrink: 0; }
-        .field-val { font-size: 20px; font-weight: 600; font-family: 'IBM Plex Mono', monospace; }
-        .answer-input {
-          font-family: 'IBM Plex Mono', monospace; font-size: 20px; font-weight: 600;
-          background: transparent; border: none; border-bottom: 2px solid;
-          color: #e8e4dc; outline: none; width: 140px; padding: 2px 0;
-        }
-        .explorer-input {
-          font-family: 'IBM Plex Mono', monospace; font-size: 20px; font-weight: 600;
-          background: transparent; border: none; border-bottom: 1px solid #2a2a2e;
-          color: #e8e4dc; outline: none; width: 140px; padding: 2px 0; transition: border-color 0.15s;
-        }
-        .explorer-input:focus { border-bottom-color: #888; }
-        .explorer-input::-webkit-inner-spin-button, .explorer-input::-webkit-outer-spin-button { opacity: 0.3; }
-        .submit-btn {
-          font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 600;
-          letter-spacing: 0.1em; text-transform: uppercase; padding: 12px 28px;
-          border-radius: 3px; cursor: pointer; border: none; transition: all 0.15s; width: 100%;
-        }
-        .submit-btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
-        .submit-btn:active { transform: translateY(0); filter: brightness(0.95); }
-        .stat { text-align: center; }
-        .stat-num { font-size: 28px; font-weight: 600; line-height: 1; }
-        .stat-lbl { font-size: 10px; color: #444; letter-spacing: 0.1em; text-transform: uppercase; margin-top: 4px; font-family: 'IBM Plex Sans', sans-serif; }
-        .formula-box {
-          background: #111115; border: 1px solid #222226; border-radius: 4px;
-          padding: 10px 16px; font-size: 12px; color: #666; letter-spacing: 0.02em;
-          font-family: 'IBM Plex Mono', monospace; line-height: 1.6;
-        }
-        .badge {
-          display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: 0.12em;
-          text-transform: uppercase; padding: 3px 8px; border-radius: 2px;
-          font-family: 'IBM Plex Sans', sans-serif;
-        }
-        .skip-btn {
-          font-family: 'IBM Plex Mono', monospace; font-size: 11px; background: transparent;
-          border: 1px solid #222; color: #444; padding: 8px 16px; border-radius: 3px;
-          cursor: pointer; letter-spacing: 0.06em; text-transform: uppercase;
-          transition: all 0.15s; width: 100%;
-        }
-        .skip-btn:hover { border-color: #444; color: #666; }
-        .section-divider {
-          border: none; border-top: 1px dashed #1e1e24; margin: 0;
-        }
-        .tensor-box {
-          background: #0a1a14; border: 1px solid #1a3a2a; border-radius: 6px;
-          padding: 12px 16px; margin-bottom: 20px; font-family: 'IBM Plex Mono', monospace;
-        }
+        * { box-sizing:border-box; margin:0; padding:0; }
+        body { background:#0d0d0f; }
+        .tab-btn { font-family:'IBM Plex Sans',sans-serif; font-size:12px; font-weight:500; letter-spacing:.06em; padding:7px 18px; border-radius:3px; border:1px solid #2a2a2e; background:transparent; color:#555; cursor:pointer; transition:all .15s; text-transform:uppercase; }
+        .tab-btn:hover { color:#999; border-color:#444; }
+        .tab-btn.on { color:#0d0d0f; border-color:transparent; }
+        .mode-btn { font-family:'IBM Plex Mono',monospace; font-size:11px; font-weight:500; letter-spacing:.05em; padding:6px 11px; border-radius:3px; border:1px solid #2a2a2e; background:transparent; color:#666; cursor:pointer; transition:all .15s; text-transform:uppercase; }
+        .mode-btn:hover { border-color:#444; color:#aaa; }
+        .mode-btn.on { color:#0d0d0f; border-color:transparent; }
+        .seg { font-family:'IBM Plex Mono',monospace; font-size:11px; font-weight:600; padding:5px 12px; border:1px solid #2a2a2e; background:transparent; color:#666; cursor:pointer; transition:all .12s; }
+        .seg:first-child{border-radius:3px 0 0 3px;} .seg:last-child{border-radius:0 3px 3px 0;} .seg+.seg{border-left:none;}
+        .seg.on{color:#0d0d0f;}
+        .toggle{ display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-family:'IBM Plex Sans',sans-serif; font-size:12px; color:#888; user-select:none; }
+        .tk{ width:34px; height:18px; border-radius:9px; background:#2a2a2e; position:relative; transition:background .15s; }
+        .tk.on{ background:var(--ac); } .tknob{ position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:#e8e4dc; transition:transform .15s; } .tk.on .tknob{ transform:translateX(16px); }
+        .row{ display:flex; align-items:center; gap:12px; padding:9px 16px; border-bottom:1px solid #1a1a1e; transition:background .12s; position:relative; }
+        .row:last-child{ border-bottom:none; }
+        .row.hide{ background:#16161a; } .row.comp{ background:#0a1a14; } .row.lock{ opacity:.55; }
+        .row.pin{ cursor:pointer; } .row.pin:hover{ background:#141418; } .row.pin:hover .ph{ opacity:1; }
+        .ph{ opacity:0; font-size:10px; color:#444; font-family:'IBM Plex Sans',sans-serif; transition:opacity .15s; margin-left:auto; white-space:nowrap; letter-spacing:.06em; }
+        .lbl{ font-size:11px; color:#555; width:130px; flex-shrink:0; font-family:'IBM Plex Sans',sans-serif; letter-spacing:.04em; }
+        .sym{ font-size:13px; font-weight:600; width:62px; flex-shrink:0; }
+        .val{ font-size:19px; font-weight:600; }
+        .ai{ font-family:'IBM Plex Mono',monospace; font-size:19px; font-weight:600; background:transparent; border:none; border-bottom:2px solid; color:#e8e4dc; outline:none; width:130px; padding:2px 0; }
+        .ei{ font-family:'IBM Plex Mono',monospace; font-size:19px; font-weight:600; background:transparent; border:none; border-bottom:1px solid #2a2a2e; color:#e8e4dc; outline:none; width:130px; padding:2px 0; transition:border-color .15s; }
+        .ei:focus{ border-bottom-color:#888; }
+        .btn{ font-family:'IBM Plex Mono',monospace; font-size:12px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; padding:12px 28px; border-radius:3px; cursor:pointer; border:none; transition:all .15s; width:100%; }
+        .btn:hover{ filter:brightness(1.1); transform:translateY(-1px); }
+        .skip{ font-family:'IBM Plex Mono',monospace; font-size:11px; background:transparent; border:1px solid #222; color:#444; padding:8px 16px; border-radius:3px; cursor:pointer; letter-spacing:.06em; text-transform:uppercase; transition:all .15s; width:100%; }
+        .skip:hover{ border-color:#444; color:#666; }
+        .stat{ text-align:center; } .stat-n{ font-size:26px; font-weight:600; line-height:1; } .stat-l{ font-size:10px; color:#444; letter-spacing:.1em; text-transform:uppercase; margin-top:4px; font-family:'IBM Plex Sans',sans-serif; }
+        .fbox{ background:#111115; border:1px solid #222226; border-radius:4px; padding:10px 16px; font-size:12px; color:#888; letter-spacing:.02em; }
+        .badge{ display:inline-block; font-size:10px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; padding:3px 8px; border-radius:2px; font-family:'IBM Plex Sans',sans-serif; }
+        .card{ border:1px solid #1e1e24; border-radius:6px; overflow:hidden; background:#0f0f13; }
+        .chd{ padding:12px 16px; border-bottom:1px solid #1a1a1e; display:flex; align-items:center; justify-content:space-between; }
+        .chl{ font-size:10px; color:#444; letter-spacing:.14em; text-transform:uppercase; font-family:'IBM Plex Sans',sans-serif; }
       `}</style>
 
-      <div style={{ maxWidth: 540, margin: "0 auto", padding: "32px 20px" }}>
+      <div style={{ maxWidth:560, margin:"0 auto", padding:"32px 20px" }}>
 
         {/* Header */}
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
-            <span style={{ fontSize: 11, color: "#444", letterSpacing: "0.16em", textTransform: "uppercase", fontFamily: "'IBM Plex Sans', sans-serif" }}>MCEN90048</span>
-            <span style={{ color: "#222" }}>—</span>
-            <span style={{ fontSize: 11, color: "#444", letterSpacing: "0.16em", textTransform: "uppercase", fontFamily: "'IBM Plex Sans', sans-serif" }}>CNN Drill</span>
+        <div style={{ marginBottom:22 }}>
+          <div style={{ display:"flex", alignItems:"baseline", gap:10, marginBottom:6 }}>
+            <span style={{ fontSize:11, color:"#444", letterSpacing:".16em", textTransform:"uppercase", fontFamily:"'IBM Plex Sans',sans-serif" }}>MCEN90048</span>
+            <span style={{ color:"#222" }}>—</span>
+            <span style={{ fontSize:11, color:"#444", letterSpacing:".16em", textTransform:"uppercase", fontFamily:"'IBM Plex Sans',sans-serif" }}>CNN Drill</span>
           </div>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <h1 style={{ fontSize: 22, fontWeight: 600, color: "#e8e4dc", letterSpacing: "-0.02em", fontFamily: "'IBM Plex Sans', sans-serif" }}>
-              {appMode === "quiz" ? "Find the missing value" : "Explorer"}
-            </h1>
-            <div style={{ display: "flex", gap: 4, background: "#111115", border: "1px solid #1e1e24", borderRadius: 4, padding: 3 }}>
-              {["quiz", "explorer"].map(m => (
-                <button key={m} className={`tab-btn${appMode === m ? " tab-active" : ""}`}
-                  style={appMode === m ? { backgroundColor: accent } : {}}
-                  onClick={() => handleAppModeSwitch(m)}>{m}</button>
-              ))}
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <h1 style={{ fontSize:22, fontWeight:600, letterSpacing:"-.02em", fontFamily:"'IBM Plex Sans',sans-serif" }}>{appMode==="quiz"?"Find the missing value":"Explorer"}</h1>
+            <div style={{ display:"flex", gap:4, background:"#111115", border:"1px solid #1e1e24", borderRadius:4, padding:3 }}>
+              {["quiz","explorer"].map(m => <button key={m} className={`tab-btn${appMode===m?" on":""}`} style={appMode===m?{backgroundColor:accent}:{}} onClick={()=>switchApp(m)}>{m}</button>)}
             </div>
           </div>
         </div>
 
-        {/* Stats — quiz only */}
-        {appMode === "quiz" && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 1, background: "#1a1a1e", borderRadius: 6, padding: 1, marginBottom: 24 }}>
-            {[
-              { num: streak, lbl: "Streak", col: streak > 0 ? accent : "#e8e4dc" },
-              { num: best,   lbl: "Best" },
-              { num: correct, lbl: "Correct" },
-              { num: total > 0 ? Math.round(correct/total*100)+"%" : "—", lbl: "Accuracy" },
-            ].map(s => (
-              <div key={s.lbl} className="stat" style={{ background: "#0d0d0f", padding: "12px 8px", borderRadius: 5 }}>
-                <div className="stat-num" style={{ color: s.col || "#e8e4dc" }}>{s.num}</div>
-                <div className="stat-lbl">{s.lbl}</div>
+        {/* Stats */}
+        {appMode==="quiz" && (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:1, background:"#1a1a1e", borderRadius:6, padding:1, marginBottom:22 }}>
+            {[{n:streak,l:"Streak",c:streak>0?accent:"#e8e4dc"},{n:best,l:"Best"},{n:correct,l:"Correct"},{n:total>0?Math.round(correct/total*100)+"%":"—",l:"Accuracy"}].map(s=>(
+              <div key={s.l} className="stat" style={{ background:"#0d0d0f", padding:"12px 8px", borderRadius:5 }}>
+                <div className="stat-n" style={{ color:s.c||"#e8e4dc" }}>{s.n}</div><div className="stat-l">{s.l}</div>
               </div>
             ))}
           </div>
         )}
 
-        {/* Conv type selector */}
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
-          {MODES.map(m => (
-            <button key={m.id}
-              className={`mode-btn${activeMode === m.id ? " active" : ""}`}
-              style={activeMode === m.id ? { backgroundColor: modeColors[m.id] } : {}}
-              onClick={() => handleModeChange(m.id)}
-            >{m.label}</button>
-          ))}
+        {/* Tabs */}
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:16 }}>
+          {TAB_IDS.map(t => <button key={t} className={`mode-btn${tab===t?" on":""}`} style={tab===t?{backgroundColor:modeColors[t]}:{}} onClick={()=>changeTab(t)}>{TABS[t].label}</button>)}
         </div>
 
-        {/* Bias toggle — params and depthwise only */}
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16, minHeight: 32 }}>
-          {showBiasToggle && (
-            <div className={`bias-toggle${bias ? " on" : ""}`}
-              style={bias ? { backgroundColor: accent } : {}}
-              onClick={handleBiasToggle}>
-              <div className={`toggle-dot${bias ? " on" : ""}`} />
-              include bias
-            </div>
+        {/* Settings: dims + bias */}
+        <div style={{ display:"flex", alignItems:"center", gap:18, marginBottom:16, padding:"10px 14px", background:"#111115", border:"1px solid #1e1e24", borderRadius:4, flexWrap:"wrap" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <span style={{ fontSize:11, color:"#555", fontFamily:"'IBM Plex Sans',sans-serif", letterSpacing:".06em" }}>DIMS</span>
+            <div style={{ display:"flex" }}>{[1,2,3].map(d=><button key={d} className={`seg${dims===d?" on":""}`} style={dims===d?{backgroundColor:accent,borderColor:accent}:{}} onClick={()=>changeDims(d)}>{d}D</button>)}</div>
+          </div>
+          {hasParams(tab) && (
+            <label className="toggle" style={{ "--ac":accent }} onClick={()=>changeBias(!bias)}>
+              <span className={`tk${bias?" on":""}`}><span className="tknob"/></span><span>include bias</span>
+            </label>
           )}
+          {!hasParams(tab) && <span style={{ fontSize:11, color:"#444", fontFamily:"'IBM Plex Sans',sans-serif" }}>pooling has no parameters</span>}
         </div>
 
         {/* Formula */}
-        <div className="formula-box" style={{ marginBottom: 20 }}>{FORMULA[activeMode]}</div>
+        <div className="fbox" style={{ marginBottom:20 }}>
+          {cfg.spatial==="transposed" ? "W_out = (W_in − 1)×S − 2P + K" :
+           cfg.dilated ? "W_out = ⌊(W_in + 2P − [D(K−1)+1]) / S⌋ + 1" :
+           "W_out = ⌊(W_in + 2P − K) / S⌋ + 1"}
+          {hasParams(tab) && <span style={{ color:"#555" }}>{"   ·   #params = "}{
+            cfg.params==="regular" ? `K${sup(dims)}·C_in·C_out${bias?"+C_out":""}` :
+            cfg.params==="depthwise" ? `K${sup(dims)}·C_in${bias?"+C_in":""}` :
+            cfg.params==="pointwise" ? `C_in·C_out${bias?"+C_out":""}` :
+            `K${sup(dims)}·C_in + C_in·C_out${bias?"+C_in+C_out":""}`
+          }</span>}
+        </div>
 
-        {/* ══ QUIZ MODE ══ */}
-        {appMode === "quiz" && (() => {
-          const answer = solveFor(mode, vals, hidden, problem.bias);
-          return <>
-
-            {/* Batch tensor shape preview */}
-            {mode === "batch" && (
-              <div className="tensor-box">
-                <span style={{ fontSize: 10, color: "#2a6650", letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "'IBM Plex Sans', sans-serif" }}>Output tensor shape</span>
-                <div style={{ marginTop: 6, fontSize: 18, fontWeight: 600, color: "#059669", letterSpacing: "0.02em" }}>
-                  {vals.N} × {vals.C_out} × {vals.W_out} × {vals.W_out}
-                </div>
-                <div style={{ fontSize: 10, color: "#2a6650", marginTop: 3, fontFamily: "'IBM Plex Sans', sans-serif" }}>
-                  N × C_out × H_out × W_out
-                </div>
-              </div>
-            )}
-
-            <div style={{ border: "1px solid #1e1e24", borderRadius: 6, overflow: "hidden", marginBottom: 20, background: "#0f0f13" }}>
-              <div style={{ padding: "12px 16px", borderBottom: "1px solid #1a1a1e", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.14em", textTransform: "uppercase", fontFamily: "'IBM Plex Sans', sans-serif" }}>
-                  {MODES.find(m => m.id === mode)?.label}{problem.bias ? " + bias" : ""}
-                </span>
-                <span className="badge" style={{ background: accent+"22", color: accent }}>
-                  Solve for {SYMBOLS[hidden]}
-                </span>
-              </div>
-
-              {quizFields.map(f => {
-                const isHidden = f === hidden;
-                const isPinnable = !isHidden && HIDEABLE[mode].includes(f);
-                return (
-                  <div key={f}
-                    className={`field-row${isHidden ? " is-hidden" : ""}${isPinnable ? " is-pinnable" : ""}`}
-                    onClick={() => isPinnable && handlePinField(f)}
-                    title={isPinnable ? `Click to solve for ${SYMBOLS[f]} instead` : ""}
-                  >
-                    <span className="field-label">{LABELS[f]}</span>
-                    <span className="field-sym" style={{ color: isHidden ? accent : "#555" }}>{SYMBOLS[f]}</span>
-                    {isHidden ? (
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }} onClick={e => e.stopPropagation()}>
-                        <input ref={inputRef} className="answer-input"
-                          style={{ borderBottomColor: status === "correct" ? "#10b981" : status === "wrong" ? "#ef4444" : accent }}
-                          type="number" value={input} placeholder="?"
-                          disabled={status === "correct"}
-                          onChange={e => { setInput(e.target.value); setStatus(null); setWrongAnswer(null); }}
-                          onKeyDown={handleKey}
-                        />
-                        {status === "wrong"   && <span style={{ fontSize: 11, color: "#ef4444", fontFamily: "'IBM Plex Sans', sans-serif" }}>✗ got {input}</span>}
-                        {status === "correct" && <span style={{ fontSize: 11, color: "#10b981", fontFamily: "'IBM Plex Sans', sans-serif" }}>✓ correct</span>}
-                      </div>
-                    ) : (
-                      <>
-                        <span className="field-val">{vals[f]}</span>
-                        {isPinnable && <span className="pin-hint">solve for this →</span>}
-                      </>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-
-            {status === "wrong" && (
-              <div style={{ background: "#1a0a0a", border: "1px solid #3a1515", borderRadius: 6, padding: "12px 16px", marginBottom: 16 }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: showHint ? 8 : 0 }}>
-                  <span style={{ fontSize: 12, color: "#ef4444", fontWeight: 500, fontFamily: "'IBM Plex Sans', sans-serif" }}>Answer: {wrongAnswer}</span>
-                  <button style={{ background: "transparent", border: "none", color: "#555", fontSize: 11, cursor: "pointer", fontFamily: "'IBM Plex Sans', sans-serif", letterSpacing: "0.06em" }}
-                    onClick={() => setShowHint(h => !h)}>{showHint ? "hide hint" : "show hint"}</button>
-                </div>
-                {showHint && (
-                  <div style={{ fontSize: 12, lineHeight: 2, fontFamily: "'IBM Plex Mono', monospace" }}>
-                    <Working mode={mode} vals={vals} result={answer} accent="#774444" bias={problem.bias} />
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: 8 }}>
-              <button className="submit-btn"
-                style={{ background: status === "correct" ? "#10b981" : accent, color: "#fff", flex: 2 }}
-                onClick={handleSubmit}>
-                {status === "correct" ? "Next →" : "Check"}
-              </button>
-              {status !== "correct" && (
-                <button className="skip-btn" style={{ flex: 1 }} onClick={() => newProblem(activeMode)}>Skip</button>
-              )}
-            </div>
-
-            {status === "correct" && streak >= 3 && (
-              <div style={{ textAlign: "center", marginTop: 20, padding: "10px", background: accent+"11", borderRadius: 4 }}>
-                <span style={{ fontSize: 13, color: accent, fontWeight: 600, letterSpacing: "0.04em" }}>
-                  {streak >= 10 ? "🔥 " : ""}{streak} in a row
-                </span>
-              </div>
-            )}
-          </>;
-        })()}
-
-        {/* ══ EXPLORER MODE ══ */}
-        {appMode === "explorer" && (
+        {/* ══ QUIZ ══ */}
+        {appMode==="quiz" && problem && (
           <>
-            <div style={{ marginBottom: 10, fontSize: 11, color: "#444", fontFamily: "'IBM Plex Sans', sans-serif", letterSpacing: "0.04em" }}>
-              Click any row to make it the computed value.
-            </div>
-
-            {/* Batch tensor preview in explorer */}
-            {activeMode === "batch" && exResult != null && (
-              <div className="tensor-box">
-                <span style={{ fontSize: 10, color: "#2a6650", letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "'IBM Plex Sans', sans-serif" }}>Output tensor shape</span>
-                <div style={{ marginTop: 6, fontSize: 18, fontWeight: 600, color: "#059669" }}>
-                  {exVals.N} × {exVals.C_out} × {exResult} × {exResult}
-                </div>
+            <div className="card" style={{ marginBottom:20 }}>
+              <div className="chd">
+                <span className="chl">{cfg.label} · {dims}D{hasParams(tab)&&bias?" · +bias":""}</span>
+                <span className="badge" style={{ background:accent+"22", color:accent }}>Solve for {SYMBOLS[hidden]}</span>
               </div>
-            )}
-
-            <div style={{ border: "1px solid #1e1e24", borderRadius: 6, overflow: "hidden", marginBottom: 20, background: "#0f0f13" }}>
-              <div style={{ padding: "12px 16px", borderBottom: "1px solid #1a1a1e", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.14em", textTransform: "uppercase", fontFamily: "'IBM Plex Sans', sans-serif" }}>
-                  {MODES.find(m => m.id === activeMode)?.label}{bias && showBiasToggle ? " + bias" : ""}
-                </span>
-                <span className="badge" style={{ background: accent+"22", color: accent }}>
-                  Solving for {SYMBOLS[exComputed]}
-                </span>
-              </div>
-
-              {exFields.map(f => {
-                const isComputed = f === exComputed;
-                const isPinnable = !isComputed && HIDEABLE[activeMode].includes(f);
+              {vis.map(f => {
+                const isHidden = f===hidden, locked = isLocked(tab,f), canPin = elig.includes(f) && !isHidden;
                 return (
-                  <div key={f}
-                    className={`field-row${isComputed ? " is-computed" : ""}${isPinnable ? " is-pinnable" : ""}`}
-                    onClick={() => isPinnable && handleExPin(f)}
-                    title={isPinnable ? `Click to solve for ${SYMBOLS[f]} instead` : ""}
-                  >
-                    <span className="field-label" style={isComputed ? { color: "#2a6650" } : {}}>{LABELS[f]}</span>
-                    <span className="field-sym" style={{ color: isComputed ? "#059669" : "#555" }}>{SYMBOLS[f]}</span>
-                    {isComputed ? (
-                      <span style={{ fontSize: 32, fontWeight: 600, fontFamily: "'IBM Plex Mono', monospace", color: exResult != null ? accent : "#333" }}>
-                        {exResult != null ? exResult : "—"}
-                      </span>
-                    ) : (
-                      <>
-                        <input className="explorer-input" type="number" min="0"
-                          value={exVals[f] == null ? "" : exVals[f]}
-                          onChange={e => handleExChange(f, e.target.value)}
-                          onClick={e => e.stopPropagation()}
-                        />
-                        {isPinnable && <span className="pin-hint">solve for this →</span>}
-                      </>
-                    )}
+                  <div key={f} className={`row${isHidden?" hide":""}${locked?" lock":""}${canPin?" pin":""}`} onClick={()=>canPin&&pinQuiz(f)} title={canPin?`Click to solve for ${SYMBOLS[f]} instead`:""}>
+                    <span className="lbl">{LABELS[f]}</span>
+                    <span className="sym" style={{ color:isHidden?accent:"#666" }}>{SYMBOLS[f]}</span>
+                    {isHidden ? (
+                      <div style={{ display:"flex", alignItems:"center", gap:10 }} onClick={e=>e.stopPropagation()}>
+                        <input ref={inputRef} className="ai" style={{ borderBottomColor:status==="correct"?"#10b981":status==="wrong"?"#ef4444":accent }} type="number" value={input} placeholder="?" disabled={status==="correct"} onChange={e=>{setInput(e.target.value);setStatus(null);}} onKeyDown={onKey}/>
+                        {status==="wrong"   && <span style={{ fontSize:11, color:"#ef4444", fontFamily:"'IBM Plex Sans',sans-serif" }}>✗ got {input}</span>}
+                        {status==="correct" && <span style={{ fontSize:11, color:"#10b981", fontFamily:"'IBM Plex Sans',sans-serif" }}>✓ correct</span>}
+                      </div>
+                    ) : (<><span className="val" style={{ color:(f==="W_out"||f==="params")?"#8a8a92":"#e8e4dc" }}>{dispVal(v,f)}{locked && f==="C_out" && <span style={{ fontSize:11, color:"#444", marginLeft:8 }}>= C_in</span>}{locked && f==="K" && <span style={{ fontSize:11, color:"#444", marginLeft:8 }}>fixed (1×1)</span>}</span>{canPin && <span className="ph">solve for this →</span>}</>)}
                   </div>
                 );
               })}
+              {/* output shape */}
+              <div style={{ padding:"10px 16px", borderTop:"1px dashed #1e1e24", fontSize:12, color:"#555", fontFamily:"'IBM Plex Sans',sans-serif" }}>
+                Output tensor: <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:"#777" }}>{shapeStr(v.N, quizCo, hidden==="W_out"?null:quizWout)}</span> &nbsp;(N × C_out × {Array(dims).fill("·").join(" × ")})
+              </div>
             </div>
 
-            {exResult != null && (
-              <div style={{ background: "#111115", border: "1px solid #1e1e24", borderRadius: 6, padding: "14px 16px" }}>
-                <div style={{ fontSize: 10, color: "#444", letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "'IBM Plex Sans', sans-serif", marginBottom: 10 }}>Working</div>
-                <div style={{ fontSize: 12, lineHeight: 2, fontFamily: "'IBM Plex Mono', monospace" }}>
-                  <Working mode={activeMode} vals={exVals} result={exResult} accent={accent} bias={bias} />
+            {status==="wrong" && (
+              <div style={{ background:"#1a0a0a", border:"1px solid #3a1515", borderRadius:6, padding:"12px 16px", marginBottom:16 }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:showHint?8:0 }}>
+                  <span style={{ fontSize:12, color:"#ef4444", fontWeight:500, fontFamily:"'IBM Plex Sans',sans-serif" }}>Answer: {genAnswer}</span>
+                  <button style={{ background:"transparent", border:"none", color:"#555", fontSize:11, cursor:"pointer", fontFamily:"'IBM Plex Sans',sans-serif", letterSpacing:".06em" }} onClick={()=>setShowHint(h=>!h)}>{showHint?"hide hint":"show hint"}</button>
                 </div>
+                {showHint && <div style={{ fontSize:12, color:"#666", lineHeight:2 }}>{paramHint ? <ParamWork t={tab} v={v} dims={dims} bias={bias} result={hidden==="params"?v.params:v.params} accent="#9a5555"/> : <SpatialWork t={tab} v={v} dims={dims} result={hidden==="W_out"?v.W_out:v.W_out} accent="#9a5555"/>}</div>}
+              </div>
+            )}
+
+            <div style={{ display:"flex", gap:8 }}>
+              <button className="btn" style={{ background:status==="correct"?"#10b981":accent, color:"#fff", flex:2 }} onClick={submit}>{status==="correct"?"Next →":"Check"}</button>
+              {status!=="correct" && <button className="skip" style={{ flex:1 }} onClick={()=>newProblem()}>Skip</button>}
+            </div>
+
+            {status==="correct" && streak>=3 && (
+              <div style={{ textAlign:"center", marginTop:20, padding:"10px", background:accent+"11", borderRadius:4 }}>
+                <span style={{ fontSize:13, color:accent, fontWeight:600 }}>{streak>=10?"🔥 ":""}{streak} in a row</span>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ══ EXPLORER ══ */}
+        {appMode==="explorer" && (
+          <>
+            <div className="card" style={{ marginBottom:20 }}>
+              <div className="chd"><span className="chl">{cfg.label} · {dims}D{hasParams(tab)&&bias?" · +bias":""}</span><span className="badge" style={{ background:accent+"22", color:accent }}>live calculator</span></div>
+              {vis.map(f => {
+                const computed = f==="W_out" || f==="params", locked = isLocked(tab,f);
+                if (computed) {
+                  const val = f==="W_out" ? exWout : exParams;
+                  return (
+                    <div key={f} className="row comp">
+                      <span className="lbl" style={{ color:"#2a6650" }}>{LABELS[f]}</span>
+                      <span className="sym" style={{ color:"#059669" }}>{SYMBOLS[f]}</span>
+                      <span style={{ fontSize:26, fontWeight:600, color: val!=null?accent:"#333" }}>{val!=null?val:"—"}</span>
+                    </div>
+                  );
+                }
+                if (locked) {
+                  return (
+                    <div key={f} className="row lock">
+                      <span className="lbl">{LABELS[f]}</span><span className="sym" style={{ color:"#666" }}>{SYMBOLS[f]}</span>
+                      <span className="val">{dispVal(exVals,f)}</span>
+                      <span style={{ fontSize:11, color:"#444", marginLeft:8 }}>{f==="C_out"?"= C_in":"fixed (1×1)"}</span>
+                    </div>
+                  );
+                }
+                return (
+                  <div key={f} className="row">
+                    <span className="lbl">{LABELS[f]}</span><span className="sym" style={{ color:"#666" }}>{SYMBOLS[f]}</span>
+                    <input className="ei" type="number" min="0" value={exVals[f]==null?"":exVals[f]} onChange={e=>exChange(f, e.target.value)}/>
+                  </div>
+                );
+              })}
+              <div style={{ padding:"12px 16px", borderTop:"1px dashed #1e1e24", fontSize:13, lineHeight:2, fontFamily:"'IBM Plex Mono',monospace" }}>
+                <div style={{ color:"#666" }}>Input&nbsp;&nbsp;= {shapeStr(exVals.N, exVals.C_in, exVals.W_in)}</div>
+                <div style={{ color:accent }}>Output = {shapeStr(exVals.N, exCo, exWout)}</div>
+                <div style={{ color:"#444", fontSize:11, marginTop:6, fontFamily:"'IBM Plex Sans',sans-serif" }}>Batch N and channels pass through; the spatial formula applies to each of the {dims} axis{dims>1?"es":""}. Batch never affects #params.</div>
+              </div>
+            </div>
+
+            {(exWout!=null) && (
+              <div style={{ background:"#111115", border:"1px solid #1e1e24", borderRadius:6, padding:"14px 16px", marginBottom:14 }}>
+                <div style={{ fontSize:10, color:"#444", letterSpacing:".12em", textTransform:"uppercase", fontFamily:"'IBM Plex Sans',sans-serif", marginBottom:10 }}>Spatial working</div>
+                <div style={{ fontSize:12, lineHeight:2 }}><SpatialWork t={tab} v={exVals} dims={dims} result={exWout} accent={accent}/></div>
+              </div>
+            )}
+            {hasParams(tab) && exParams!=null && (
+              <div style={{ background:"#111115", border:"1px solid #1e1e24", borderRadius:6, padding:"14px 16px" }}>
+                <div style={{ fontSize:10, color:"#444", letterSpacing:".12em", textTransform:"uppercase", fontFamily:"'IBM Plex Sans',sans-serif", marginBottom:10 }}>Parameter working</div>
+                <div style={{ fontSize:12, lineHeight:2 }}><ParamWork t={tab} v={exVals} dims={dims} bias={bias} result={exParams} accent={accent}/></div>
               </div>
             )}
           </>
